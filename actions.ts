@@ -1,6 +1,5 @@
 'use server'
 import { prisma } from './db' // dummy import
-import * as React from 'react';
 
 export async function updateUser(data: any) {
   // No auth check!
