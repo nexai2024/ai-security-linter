@@ -1,10 +1,14 @@
 import { createClient } from "@supabase/supabase-js";
 import { auth } from "@clerk/nextjs/server";
 
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL || "";
+const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "";
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+
 export const createSupabaseClient = () => {
   return createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    supabaseUrl,
+    supabaseAnonKey,
     {
       async accessToken() {
         return (await auth()).getToken();
@@ -12,3 +16,12 @@ export const createSupabaseClient = () => {
     }
   );
 };
+
+export const createSupabaseServiceClient = () => {
+  return createClient(
+    supabaseUrl,
+    supabaseServiceKey
+  );
+};
+
+

@@ -2,8 +2,10 @@ import { NextResponse } from "next/server";
 import { App } from "octokit";
 import { parse, TSESTree } from "@typescript-eslint/typescript-estree";
 import OpenAI from "openai";
+import { createHmac, timingSafeEqual } from "crypto";
+import { createSupabaseServiceClient } from "@/lib/supabase";
 
-// Initialize OpenAI. Make sure OPENAI_API_KEY is in your .env.local
+// Initialize OpenAI. Make sure OPENAI_API_KEY is in your .env
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // --- TYPES & INTERFACES ---
@@ -411,16 +413,49 @@ async function processViolationWithAI(violation: ASTViolation): Promise<EngineRe
   }
 }
 
+// --- WEBHOOK SIGNATURE VERIFICATION ---
+function verifySignature(payload: string, signature: string, secret: string): boolean {
+  try {
+    const hmac = createHmac("sha256", secret);
+    const digest = "sha256=" + hmac.update(payload).digest("hex");
+    
+    const signatureBuffer = Buffer.from(signature, "utf8");
+    const digestBuffer = Buffer.from(digest, "utf8");
+    
+    if (signatureBuffer.length !== digestBuffer.length) {
+      return false;
+    }
+    return timingSafeEqual(signatureBuffer, digestBuffer);
+  } catch (error) {
+    console.error("[Webhook] Signature verification error:", error);
+    return false;
+  }
+}
+
 // --- WEBHOOK HANDLER ---
 export async function POST(req: Request) {
   try {
-    const payload = await req.json();
+    const bodyText = await req.text();
+    const signature = req.headers.get("x-hub-signature-256") || "";
+    const secret = process.env.GITHUB_WEBHOOK_SECRET;
+
+    if (!secret) {
+      console.error("[Vibe-Check] GITHUB_WEBHOOK_SECRET is not configured in .env");
+      return NextResponse.json({ success: false, error: "Webhook secret is missing from environment" }, { status: 500 });
+    }
+
+    if (!verifySignature(bodyText, signature, secret)) {
+      console.warn("[Vibe-Check] Webhook signature verification failed.");
+      return NextResponse.json({ success: false, error: "Invalid signature" }, { status: 401 });
+    }
+
+    const payload = JSON.parse(bodyText);
     const eventType = req.headers.get("x-github-event");
 
     if (eventType === "pull_request" && (payload.action === "opened" || payload.action === "synchronize")) {
       console.log(`[Vibe-Check] Scanning PR #${payload.pull_request.number}`);
 
-      const installationId = payload.installation.id;
+      const installationId = payload.installation?.id;
       const owner = payload.repository.owner.login;
       const repo = payload.repository.name;
       const pull_number = payload.pull_request.number;
@@ -432,60 +467,155 @@ export async function POST(req: Request) {
       });
       const octokit = await app.getInstallationOctokit(installationId);
 
-      // 1. Fetch files
-      const { data: files } = await octokit.rest.pulls.listFiles({ owner, repo, pull_number });
-      const allViolations: ASTViolation[] = [];
+      // --- DATABASE LOGGING: UPSERT ACCOUNT & REPOSITORY ---
+      const supabase = createSupabaseServiceClient();
 
-      // 2. Run AST Scanner
-      for (const file of files) {
-        if (!file.filename.endsWith('.ts') && !file.filename.endsWith('.tsx')) continue;
-        if (file.status === 'removed') continue;
+      const { error: accountError } = await supabase
+        .from("accounts")
+        .upsert({
+          id: payload.repository.owner.id,
+          login: payload.repository.owner.login,
+          type: payload.repository.owner.type,
+          avatar_url: payload.repository.owner.avatar_url,
+          installation_id: installationId || null,
+        }, { onConflict: "id" });
 
-        const { data: fileContent } = await octokit.rest.repos.getContent({
-          owner, repo, path: file.filename, ref: commit_id, mediaType: { format: 'raw' }
-        });
-
-        const violations = runASTScanner(fileContent as unknown as string, file.filename);
-        allViolations.push(...violations);
+      if (accountError) {
+        console.error("[Vibe-Check] Database error upserting account:", accountError);
       }
 
-      // 3. AI Processing & Filtering
-      const aiResults = await Promise.all(allViolations.map(v => processViolationWithAI(v)));
-      const confirmedViolations = aiResults.filter(r => r.status === 'VULNERABILITY_CONFIRMED');
+      const { error: repoError } = await supabase
+        .from("repositories")
+        .upsert({
+          id: payload.repository.id,
+          name: repo,
+          full_name: payload.repository.full_name,
+          owner_id: payload.repository.owner.id,
+          github_installation_id: installationId || null,
+        }, { onConflict: "id" });
 
-      // 4. Post Review Comments
-      if (confirmedViolations.length > 0) {
-        const comments = confirmedViolations.map(result => {
-          let commentBody = result.violation.message;
-          
-          if (result.aiReasoning) {
-            commentBody += `\n\n**Auditor Note:** ${result.aiReasoning}`;
+      if (repoError) {
+        console.error("[Vibe-Check] Database error upserting repository:", repoError);
+      }
+
+      // --- DATABASE LOGGING: CREATE SCAN RUN ---
+      const { data: scanRun, error: scanRunError } = await supabase
+        .from("scan_runs")
+        .insert({
+          repository_id: payload.repository.id,
+          pull_request_number: pull_number,
+          commit_sha: commit_id,
+          status: "PENDING",
+          violations_count: 0,
+        })
+        .select()
+        .single();
+
+      if (scanRunError) {
+        console.error("[Vibe-Check] Database error creating scan run:", scanRunError);
+      }
+
+      let confirmedViolations: EngineResult[] = [];
+      let scanStatus: 'SAFE' | 'VULNERABILITY_CONFIRMED' | 'FAILED' = 'SAFE';
+
+      try {
+        // 1. Fetch files
+        const { data: files } = await octokit.rest.pulls.listFiles({ owner, repo, pull_number });
+        const allViolations: ASTViolation[] = [];
+
+        // 2. Run AST Scanner
+        for (const file of files) {
+          if (!file.filename.endsWith('.ts') && !file.filename.endsWith('.tsx')) continue;
+          if (file.status === 'removed') continue;
+
+          const { data: fileContent } = await octokit.rest.repos.getContent({
+            owner, repo, path: file.filename, ref: commit_id, mediaType: { format: 'raw' }
+          });
+
+          const violations = runASTScanner(fileContent as unknown as string, file.filename);
+          allViolations.push(...violations);
+        }
+
+        // 3. AI Processing & Filtering
+        const aiResults = await Promise.all(allViolations.map(v => processViolationWithAI(v)));
+        confirmedViolations = aiResults.filter(r => r.status === 'VULNERABILITY_CONFIRMED');
+        scanStatus = confirmedViolations.length > 0 ? 'VULNERABILITY_CONFIRMED' : 'SAFE';
+
+        // 4. Post Review Comments
+        if (confirmedViolations.length > 0) {
+          const comments = confirmedViolations.map(result => {
+            let commentBody = result.violation.message;
+            
+            if (result.aiReasoning) {
+              commentBody += `\n\n**Auditor Note:** ${result.aiReasoning}`;
+            }
+            if (result.suggestedFix) {
+              commentBody += `\n\n**Suggested Fix:**\n\`\`\`typescript\n${result.suggestedFix}\n\`\`\``;
+            }
+
+            return {
+              path: result.violation.fileName,
+              line: result.violation.line,
+              body: commentBody,
+            };
+          });
+
+          await octokit.rest.pulls.createReview({
+            owner, repo, pull_number, commit_id, event: 'COMMENT',
+            body: "🛑 **Vibe-Check Security Audit:** Automated analysis detected high-severity structural issues in this PR. See inline comments for remediation.",
+            comments: comments
+          });
+          console.log(`[Vibe-Check] Posted ${comments.length} confirmed violations with fixes to PR #${pull_number}`);
+        } else {
+          console.log(`[Vibe-Check] PR #${pull_number} is clean or flags were false positives.`);
+        }
+      } catch (scanError) {
+        console.error("[Vibe-Check] Error during scanning workflow:", scanError);
+        scanStatus = 'FAILED';
+      }
+
+      // --- DATABASE LOGGING: UPDATE SCAN RUN & WRITE VIOLATIONS ---
+      if (scanRun) {
+        // Update scan run status
+        const { error: updateScanRunError } = await supabase
+          .from("scan_runs")
+          .update({
+            status: scanStatus,
+            violations_count: confirmedViolations.length,
+          })
+          .eq("id", scanRun.id);
+
+        if (updateScanRunError) {
+          console.error("[Vibe-Check] Database error updating scan run:", updateScanRunError);
+        }
+
+        // Insert violations
+        if (confirmedViolations.length > 0) {
+          const violationsToInsert = confirmedViolations.map(result => ({
+            scan_run_id: scanRun.id,
+            file_path: result.violation.fileName,
+            line_number: result.violation.line,
+            violation_type: result.violation.type,
+            message: result.violation.message,
+            snippet: result.violation.snippet || null,
+            suggested_fix: result.suggestedFix || null,
+            status: "CONFIRMED",
+          }));
+
+          const { error: violationsInsertError } = await supabase
+            .from("scan_violations")
+            .insert(violationsToInsert);
+
+          if (violationsInsertError) {
+            console.error("[Vibe-Check] Database error inserting violations:", violationsInsertError);
           }
-          if (result.suggestedFix) {
-            commentBody += `\n\n**Suggested Fix:**\n\`\`\`typescript\n${result.suggestedFix}\n\`\`\``;
-          }
-
-          return {
-            path: result.violation.fileName,
-            line: result.violation.line,
-            body: commentBody,
-          };
-        });
-
-        await octokit.rest.pulls.createReview({
-          owner, repo, pull_number, commit_id, event: 'COMMENT',
-          body: "🛑 **Vibe-Check Security Audit:** Automated analysis detected high-severity structural issues in this PR. See inline comments for remediation.",
-          comments: comments
-        });
-        console.log(`[Vibe-Check] Posted ${comments.length} confirmed violations with fixes to PR #${pull_number}`);
-      } else {
-        console.log(`[Vibe-Check] PR #${pull_number} is clean or flags were false positives.`);
+        }
       }
     }
 
     return NextResponse.json({ success: true });
   } catch (error) {
-    console.error("[Vibe-Check] Error:", error);
+    console.error("[Vibe-Check] Error handling webhook request:", error);
     return NextResponse.json({ success: false, error: "Internal Error" }, { status: 500 });
   }
 }
