@@ -12,7 +12,7 @@ import {
   FormLabel,
 } from "./ui/form";
 import { Button } from "./ui/button";
-import { createComment } from "@/lib/actions/comment.actions";
+
 import { Textarea } from "./ui/textarea";
 
 const formSchema = z.object({
@@ -21,7 +21,7 @@ const formSchema = z.object({
   }),
 });
 
-const CommentForm = ({ recipeId }: { recipeId: string }) => {
+const CommentForm = () => {
   const form = useForm<z.infer<typeof formSchema>>({
     resolver: zodResolver(formSchema),
     defaultValues: {
@@ -30,7 +30,7 @@ const CommentForm = ({ recipeId }: { recipeId: string }) => {
   });
 
   const onSubmit = async (values: z.infer<typeof formSchema>) => {
-    await createComment(values.comment, recipeId);
+    return values.comment;
   };
 
   return (
