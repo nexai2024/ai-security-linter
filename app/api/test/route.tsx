@@ -45,7 +45,7 @@ function runASTScanner(code: string, fileName: string): ASTViolation[] {
   try {
     ast = parse(code, { loc: true, range: true, jsx: fileName.endsWith('.tsx') });
   } catch (e) {
-    console.error(`[Vibe-Check] Failed to parse AST for ${fileName}`);
+    console.error(`[Vibe-Check] Failed to parse AST for ${fileName}`, e);
     return violations;
   }
 
@@ -61,7 +61,7 @@ function runASTScanner(code: string, fileName: string): ASTViolation[] {
   const codeStrLower = code.toLowerCase();
   const hasRateLimitImport = codeStrLower.includes('ratelimit') || codeStrLower.includes('rate-limit');
 
-  function walk(node: any) {
+  function walk(node: TSESTree.Node) {
     if (!node) return;
 
     // RULE: SEC-001 - Naked Server Action Check
@@ -181,7 +181,7 @@ function runASTScanner(code: string, fileName: string): ASTViolation[] {
     }
 
     // RULE: STRUC-001 - Cache Poisoning
-    if (node.type === 'CallExpression' && node.callee?.name === 'fetch') {
+    if (node.type === 'CallExpression' && node.callee.type === 'Identifier' && node.callee.name === 'fetch') {
       const argsStr = JSON.stringify(node.arguments);
       if ((argsStr.includes('Authorization') || argsStr.includes('cookie') || argsStr.includes('bearer')) && !argsStr.includes('no-store') && !argsStr.includes('revalidate')) {
         violations.push({
@@ -195,7 +195,7 @@ function runASTScanner(code: string, fileName: string): ASTViolation[] {
     }
 
     // RULE: SEC-006 - Exposed Server Secrets
-    if (node.type === 'VariableDeclarator' && node.id?.name) {
+    if (node.type === 'VariableDeclarator' && node.id?.type === 'Identifier' && node.id.name) {
        const varName = node.id.name.toUpperCase();
        if (varName.startsWith('NEXT_PUBLIC_') && (varName.includes('SECRET') || varName.includes('PASSWORD') || varName.includes('KEY'))) {
           violations.push({
@@ -221,7 +221,7 @@ function runASTScanner(code: string, fileName: string): ASTViolation[] {
     }
 
     // RULE: PERF-003 - Serverless Connection Pool Exhaustion
-    if (node.type === 'NewExpression' && node.callee?.name === 'PrismaClient') {
+    if (node.type === 'NewExpression' && node.callee.type === 'Identifier' && node.callee.name === 'PrismaClient') {
       violations.push({
         type: 'CONNECTION_POOL_EXHAUSTION',
         line: node.loc.start.line,
@@ -232,7 +232,7 @@ function runASTScanner(code: string, fileName: string): ASTViolation[] {
     }
 
     if (node.type === 'CallExpression' && node.callee.type === 'MemberExpression') {
-      const methodName = (node.callee.property as any).name;
+      const methodName = (node.callee.property as TSESTree.Identifier).name;
 
       // RULE: PERF-001 - Prisma N+1 Loop
       if (methodName === 'map' || methodName === 'forEach') {
@@ -279,7 +279,7 @@ function runASTScanner(code: string, fileName: string): ASTViolation[] {
       // RULE: SEC-009 - Unparameterized Raw SQL Injection
       if (methodName === '$queryRaw' || methodName === '$executeRaw') {
         const arg = node.arguments[0];
-        if (arg && (arg.type === 'TemplateLiteral' || arg.type === 'BinaryExpression' || typeof arg.value === 'string')) {
+        if (arg && (arg.type === 'TemplateLiteral' || arg.type === 'BinaryExpression' || (arg.type === 'Literal' && typeof arg.value === 'string'))) {
            violations.push({
             type: 'RAW_SQL_INJECTION',
             line: node.loc.start.line,
@@ -292,7 +292,11 @@ function runASTScanner(code: string, fileName: string): ASTViolation[] {
     }
 
     for (const key in node) {
-      if (typeof node[key] === 'object') walk(node[key]);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const child = (node as any)[key];
+      if (child && typeof child === 'object') {
+        walk(child);
+      }
     }
   }
 
@@ -439,9 +443,9 @@ export async function POST(req: Request) {
 
         const { data: fileContent } = await octokit.rest.repos.getContent({
           owner, repo, path: file.filename, ref: commit_id, mediaType: { format: 'raw' }
-        }) as any;
+        });
 
-        const violations = runASTScanner(fileContent, file.filename);
+        const violations = runASTScanner(fileContent as unknown as string, file.filename);
         allViolations.push(...violations);
       }
 
