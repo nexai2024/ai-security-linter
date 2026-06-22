@@ -1,4 +1,5 @@
 'use server'
+import * as React from 'react';
 import { prisma } from './db' // dummy import
 
 export async function updateUser(data: any) {
