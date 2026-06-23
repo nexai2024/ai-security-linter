@@ -519,6 +519,16 @@ export async function POST(req: Request) {
       let scanStatus: 'SAFE' | 'VULNERABILITY_CONFIRMED' | 'FAILED' = 'SAFE';
 
       try {
+        // Fetch rule settings for this repository
+        const { data: repoSettings } = await supabase
+          .from("repositories")
+          .select("rule_settings")
+          .eq("id", payload.repository.id)
+          .single();
+
+        const ruleSettings = (repoSettings?.rule_settings as Record<string, boolean>) || {};
+        const isRuleEnabled = (type: string) => ruleSettings[type] !== false;
+
         // 1. Fetch files
         const { data: files } = await octokit.rest.pulls.listFiles({ owner, repo, pull_number });
         const allViolations: ASTViolation[] = [];
@@ -533,7 +543,9 @@ export async function POST(req: Request) {
           });
 
           const violations = runASTScanner(fileContent as unknown as string, file.filename);
-          allViolations.push(...violations);
+          // Filter violations based on enabled rules
+          const enabledViolations = violations.filter((v) => isRuleEnabled(v.type));
+          allViolations.push(...enabledViolations);
         }
 
         // 3. AI Processing & Filtering
