@@ -10,9 +10,7 @@ export const createSupabaseClient = () => {
     supabaseUrl,
     supabaseAnonKey,
     {
-      async accessToken() {
-        return (await auth()).getToken();
-      },
+      accessToken: async () => (await auth()).getToken(),
     }
   );
 };

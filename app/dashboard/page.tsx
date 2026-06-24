@@ -42,7 +42,7 @@ export default async function DashboardPage(props: {
   }
 
   // Trigger sync of user account from Clerk (runs server-side)
-  await syncAccount();
+  const syncResult = await syncAccount();
 
   const supabase = createSupabaseServiceClient();
 
@@ -111,6 +111,16 @@ export default async function DashboardPage(props: {
           <div className="p-4 bg-emerald-500/10 border border-emerald-500/20 rounded-2xl text-emerald-300 flex items-center gap-3 text-sm">
             <ShieldCheck className="h-5 w-5 text-emerald-400 shrink-0" />
             <span>GitHub App installation successfully completed! Repositories are now synchronized.</span>
+          </div>
+        )}
+
+        {/* Warning Banner if GitHub is not connected */}
+        {syncResult?.success === false && syncResult.error === "GitHub account not connected in Clerk" && (
+          <div className="p-4 bg-amber-500/10 border border-amber-500/20 rounded-2xl text-amber-300 flex items-center gap-3 text-sm">
+            <AlertCircle className="h-5 w-5 text-amber-400 shrink-0" />
+            <div>
+              <span className="font-semibold">GitHub Connection Required:</span> Your Clerk account is not connected to GitHub. Please sign in with GitHub, or connect GitHub in your user settings, to link and protect repositories.
+            </div>
           </div>
         )}
 

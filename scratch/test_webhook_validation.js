@@ -1,7 +1,8 @@
 const { createHmac } = require('crypto');
 
 // Set GITHUB_WEBHOOK_SECRET locally for test execution
-process.env.GITHUB_WEBHOOK_SECRET = 'test-secret-123';
+process.env.GITHUB_WEBHOOK_SECRET = 'ai-security-linter-secret-key-!@#';
+
 
 async function runTests() {
   console.log('=== Webhook Validation Test ===');

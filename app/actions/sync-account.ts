@@ -17,7 +17,7 @@ export async function syncAccount() {
 
     // Look for GitHub oauth external account
     const githubAccount = user.externalAccounts.find(
-      (acc) => acc.provider === "oauth_github"
+      (acc) => acc.provider === "github" || acc.provider === "oauth_github"
     ) as unknown as { providerUserId: string; username?: string; avatarUrl?: string };
 
     if (!githubAccount) {
